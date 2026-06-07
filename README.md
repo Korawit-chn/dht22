@@ -16,3 +16,17 @@ Inside venv
 pip3 install adafruit-circuitpython-dht
 pip install requests
 ```
+
+config.txt example 
+```
+Type: DHT22
+Location: Outside Dome 1
+GPIO: D17
+```
+
+networkList.txt example
+```
+10.230.146.87
+192.168.1.100
+192.168.1.130
+```
