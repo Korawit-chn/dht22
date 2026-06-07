@@ -6,92 +6,160 @@ import board
 import adafruit_dht
 from datetime import datetime
 
-# Find server
-base_url = sensorVPD.network.networkSearch("networkList.txt", 5000, "")
+NETWORK_LIST = "networkList.txt"
+NETWORK_PORT = 5000
+NETWORK_ROUTE = ""
+NETWORK_RETRY_SECONDS = 60
+READ_INTERVAL_SECONDS = 2
+CLEANUP_DAYS = 30
 
-# Read config
+sensorVPD.cache.init_db()
+
 config = sensorVPD.configReader.readConfig("config.txt")
-
 gpio = config.get("gpio")
+sensor_type = config.get("sensorType")
 
-if gpio is None:
-    pass
+base_url = None
+sensor_id = None
+last_network_check = 0
 
-if base_url is None:
-    print("No server found")
-    exit()
+dht = None
 
-# DHT22 Sensor
-dht = adafruit_dht.DHT22(getattr(board, gpio))
+if gpio:
+    try:
+        dht = adafruit_dht.DHT22(getattr(board, gpio))
+    except Exception as e:
+        print("Sensor initialization failed:", e)
+else:
+    if sensor_type == "DHT22":
+        print("Warning: DHT22 requires GPIO configuration. Sensor reads will be disabled until GPIO is configured.")
 
-try:
-    # Register sensor
-    register_url = f"{base_url}/api/registerSensor"
 
-    r = requests.post(
-        register_url,
-        json=config,
-        timeout=5
+def discover_backend():
+    global base_url
+
+    try:
+        new_url = sensorVPD.network.networkSearch(NETWORK_LIST, NETWORK_PORT, NETWORK_ROUTE)
+
+        if new_url != base_url:
+            if new_url:
+                print("Backend discovered:", new_url)
+            else:
+                print("Backend unavailable")
+
+        base_url = new_url
+
+    except Exception as e:
+        print("Backend discovery error:", e)
+        base_url = None
+
+
+def register_sensor_if_needed():
+    global sensor_id
+
+    if base_url is None or sensor_id is not None:
+        return
+
+    try:
+        register_url = f"{base_url}/api/registerSensor"
+        r = requests.post(register_url, json=config, timeout=5)
+        r.raise_for_status()
+        response = r.json()
+
+        sensor_id = response.get("sensorID")
+
+        if sensor_id:
+            print(f"Registered sensor ID: {sensor_id}")
+        else:
+            print("Registration response did not include sensorID")
+
+    except Exception as e:
+        print("Registration failed:", e)
+
+
+def flush_queue():
+    if base_url is None or sensor_id is None:
+        return
+
+    data_url = f"{base_url}/api/getDataDHT"
+    rows = sensorVPD.cache.get_unsent()
+
+    for row in rows:
+        payload = {
+            "sensorID": sensor_id,
+            "temperature": row["temperature"],
+            "humidity": row["humidity"],
+            "VPD": row["vpd"],
+            "time": row["timestamp"]
+        }
+
+        try:
+            r = requests.post(data_url, json=payload, timeout=5)
+
+            if r.status_code == 200:
+                sensorVPD.cache.mark_uploaded(row["id"])
+                print(f"Uploaded record {row['id']} at {row['timestamp']}")
+            else:
+                print(f"Upload failed for record {row['id']}: {r.status_code} {r.text}")
+                break
+
+        except Exception as e:
+            print(f"Upload error for record {row['id']}:", e)
+            break
+
+
+def maybe_refresh_network():
+    global last_network_check
+    now = time.time()
+
+    if now - last_network_check >= NETWORK_RETRY_SECONDS:
+        discover_backend()
+        register_sensor_if_needed()
+        flush_queue()
+        sensorVPD.cache.cleanup(CLEANUP_DAYS)
+        last_network_check = now
+
+
+def read_sensor():
+    if dht is None:
+        raise RuntimeError("No sensor configured")
+
+    temperature = dht.temperature
+    humidity = dht.humidity
+
+    if temperature is None or humidity is None:
+        raise RuntimeError("Sensor returned invalid values")
+
+    vpd = (
+        0.6108
+        * math.exp((17.27 * temperature) / (temperature + 237.3))
+        * (1 - (humidity / 100))
     )
 
-    r.raise_for_status()
+    return temperature, humidity, vpd
 
-    response = r.json()
-
-    sensor_id = response["sensorID"]
-
-    print(f"Registered sensor ID: {sensor_id}")
-
-except Exception as e:
-    print("Registration failed:", e)
-    exit()
-
-# Data upload endpoint
-data_url = f"{base_url}/api/getDataDHT"
 
 while True:
-
+    maybe_refresh_network()
     timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
     try:
-        temperature = dht.temperature
-        humidity = dht.humidity
-
-        vpd = (
-            0.6108
-            * math.exp((17.27 * temperature) / (temperature + 237.3))
-            * (1 - (humidity / 100))
-        )
-
-        data = {
-            "sensorID": sensor_id,
-            "temperature": temperature,
-            "humidity": humidity,
-            "VPD": vpd,
-            "time": timestamp
-        }
-
-        r = requests.post(
-            data_url,
-            json=data,
-            timeout=5
-        )
+        temperature, humidity, vpd = read_sensor()
+        sensorVPD.cache.save_reading(timestamp, temperature, humidity, vpd)
 
         print(
-            f"{timestamp} ({gpio}) "
-            f"Temp: {temperature:.1f}°C "
-            f"Humidity: {humidity:.1f}% "
-            f"VPD: {vpd:.2f}kPa "
-            f"POST: {r.status_code}"
+            f"{timestamp} ({gpio}) Temp: {temperature:.1f}°C "
+            f"Humidity: {humidity:.1f}% VPD: {vpd:.2f}kPa "
+            f"Saved locally"
         )
 
-        if r.status_code != 200:
-            print("Upload failed:", r.text)
+        register_sensor_if_needed()
+        flush_queue()
 
     except RuntimeError as error:
         print(f"{timestamp} ({gpio}) Reading error:", error)
 
     except Exception as e:
-        print("Error:", e)
+        print(f"{timestamp} ({gpio}) Error:", e)
 
-    time.sleep(2)
+    time.sleep(READ_INTERVAL_SECONDS)
